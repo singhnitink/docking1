@@ -77,7 +77,7 @@ VINA_CONFIG_FILE = "vina_config.txt"
 VINA_OUT_PDBQT = "docked_ligand.pdbqt"
 VINA_LOG_FILE = "vina_run.log" # Vina output will be redirected here
 
-# --- Helper Functions ---
+
 
 def check_executables():
     """Checks if OpenBabel and Vina are accessible."""
