@@ -1,20 +1,16 @@
-#!/usr/bin/env python
 
-# ==============================================================================
+
 # GOOGLE COLAB SETUP:
-# ==============================================================================
-# Before running this script in a Google Colab notebook,
-# execute the following commands in a Colab cell to install dependencies:
+
+# Before running this script in a Google Colab notebook,execute the following commands in a Colab cell to install dependencies:
 #
 # !apt-get update
-
-#
 
 # !apt-get install -y openbabel autodock-vina wget
 #!pip install "numpy<3.0"
 #!pip install biopython rdkit-pypi mdanalysis MDAnalysisTests
 
-# ==============================================================================
+
 import argparse
 import os
 import subprocess
