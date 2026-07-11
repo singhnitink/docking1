@@ -15,11 +15,11 @@ This repository provides a streamlined pipeline to compute **binding affinities*
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 Before using the pipeline, make sure the following dependencies are installed:
 
-### 📗 System Packages
+### System Packages
 - Python ≥ 3.7
 - `wget` (Linux/Mac)
 - `autodock-vina` (Vina 1.2.x or newer)
