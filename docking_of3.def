@@ -1,0 +1,243 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.5.1-base-ubuntu24.04
+
+%arguments
+    # yes = download the ~2.3 GB OpenFold3 checkpoint into the image at build
+    # time, so the container never downloads anything and never prompts.
+    # no  = slim image; parameters are fetched once into $OPENFOLD_CACHE
+    #       (default ~/.openfold3 on the host) the first time you fold.
+    BAKE_WEIGHTS=no
+
+%labels
+    Description  OpenFold3 co-folding + AutoDock Vina binding scores, self-contained.
+    Pipeline     make_query.py -> run_openfold predict -> docking.py
+    OpenFold3    0.4.3
+    Vina         1.2.5 (Ubuntu autodock-vina)
+    OpenBabel    3.1.1
+
+%files
+    docking.py       /opt/docking/docking.py
+    make_query.py    /opt/docking/make_query.py
+    run_pipeline.sh  /opt/docking/run_pipeline.sh
+    README.md        /opt/docking/README.md
+
+%environment
+    export DOCKING_HOME=/opt/docking
+    export OF3_PY=/opt/conda/envs/of3/bin
+    export DOCK_PY=/opt/conda/envs/docking/bin/python
+    # Checkpoint baked into the image. May legitimately not exist (slim builds).
+    export OF3_CKPT=/opt/openfold3/of3-p2-155k.pt
+    # Where OpenFold3 looks for / downloads parameters when nothing is baked in.
+    # This MUST be writable: openfold3 writes a "ckpt_root" marker here even when
+    # the weights are already present, so it can never point inside the read-only
+    # image. $HOME is bind-mounted from the host by Apptainer, so this persists
+    # between runs and is shared by every container on the machine.
+    export OPENFOLD_CACHE="${OPENFOLD_CACHE:-$HOME/.openfold3}"
+    export PATH="/opt/conda/envs/docking/bin:/opt/docking:$PATH"
+    export CUDA_HOME=/usr/local/cuda
+    export CUDA_PATH=/usr/local/cuda
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    # keep numeric libraries from oversubscribing cores when many jobs run at once
+    export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---------------------------------------------------------------------
+    # system packages
+    # ---------------------------------------------------------------------
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates curl wget git bzip2 \
+        build-essential
+    add-apt-repository -y universe
+    apt-get update
+
+    # Vina 1.2.5 and Open Babel 3.1.1 come straight from Ubuntu 24.04, which is
+    # exactly the pair the scoring pipeline was validated against.
+    apt-get install -y --no-install-recommends autodock-vina openbabel
+
+    # Toolchain for DeepSpeed's JIT CUDA extensions. Torch cu124 extensions do not
+    # build with Ubuntu 24.04's default gcc-13, so pin gcc/g++ 12.
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-12-5 cuda-libraries-dev-12-5 gcc-12 g++-12
+    ln -sf /usr/bin/gcc-12 /usr/bin/gcc
+    ln -sf /usr/bin/g++-12 /usr/bin/g++
+    ln -sf /usr/bin/gcc-12 /usr/bin/x86_64-linux-gnu-gcc
+    ln -sf /usr/bin/g++-12 /usr/bin/x86_64-linux-gnu-g++
+
+    rm -rf /var/lib/apt/lists/*
+
+    # ---------------------------------------------------------------------
+    # conda (Miniforge: conda-forge only, so nothing here depends on the
+    # Anaconda default channels or their terms of use)
+    # ---------------------------------------------------------------------
+    curl -fsSL -o /tmp/miniforge.sh \
+        https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+    bash /tmp/miniforge.sh -b -p /opt/conda
+    rm -f /tmp/miniforge.sh
+    . /opt/conda/etc/profile.d/conda.sh
+    conda config --system --set channel_priority strict
+    conda config --system --remove-key channels || true
+    conda config --system --add channels conda-forge
+
+    # ---------------------------------------------------------------------
+    # 1. scoring environment: RDKit + Biopython + NumPy, plus pandas for analysis
+    # ---------------------------------------------------------------------
+    # pyyaml lets the scorer read a Boltz run's input YAML to recover the ligand SMILES
+    conda create -y -p /opt/conda/envs/docking -c conda-forge \
+        python=3.11 rdkit biopython numpy pandas pyyaml
+    conda clean -afy
+
+    # ---------------------------------------------------------------------
+    # 2. OpenFold3 environment
+    # ---------------------------------------------------------------------
+    conda create -y -p /opt/conda/envs/of3 -c conda-forge python=3.12
+    OF3=/opt/conda/envs/of3/bin
+    $OF3/pip install --no-cache-dir --upgrade pip
+    $OF3/pip install --no-cache-dir torch==2.4.0 \
+        --index-url https://download.pytorch.org/whl/cu124
+    $OF3/pip install --no-cache-dir "openfold3[deepspeed]==0.4.3"
+    $OF3/pip install --no-cache-dir "biotite<1.7.0" nvidia-cutlass
+
+    # Force fp16 in the DeepSpeed / Triton evoformer-attention kernels. Inherited
+    # from a known-good build of this stack. NOTE: with the runner config this
+    # container ships (use_deepspeed_evo_attention: false) those kernels are never
+    # dispatched, so this patch is dormant; it only matters if you re-enable them
+    # in run_pipeline.sh's runner YAML. Harmless either way.
+    ATTN=/opt/conda/envs/of3/lib/python3.12/site-packages/openfold3/core/model/primitives/attention.py
+    if [ -f "$ATTN" ]; then
+        sed -i 's/return x\.to(dtype=torch\.bfloat16)/return x.to(dtype=torch.float16)/g' "$ATTN"
+        sed -i 's/\.to(dtype=torch\.bfloat16)/\.to(dtype=torch.float16)/g' "$ATTN"
+    else
+        echo "WARNING: $ATTN not found; skipping the fp16 patch (layout may have changed)"
+    fi
+
+    # Resolve CUTLASS once at build time so every run does not pay for it.
+    CUTLASS=$($OF3/python -c \
+        'import cutlass_library, pathlib; print(pathlib.Path(cutlass_library.__file__).resolve().parent / "source")' \
+        2>/dev/null || true)
+    if [ -n "$CUTLASS" ]; then
+        echo "export CUTLASS_PATH=$CUTLASS" >> "$APPTAINER_ENVIRONMENT"
+    fi
+
+    # ---------------------------------------------------------------------
+    # wiring + build-time sanity checks
+    # ---------------------------------------------------------------------
+    chmod +x /opt/docking/run_pipeline.sh /opt/docking/docking.py /opt/docking/make_query.py
+    ln -sf /opt/docking/run_pipeline.sh /usr/local/bin/docking-pipeline
+    mkdir -p /opt/openfold3
+
+    # ---------------------------------------------------------------------
+    # optional: bake the model parameters into the image
+    # ---------------------------------------------------------------------
+    # The parameters live in a PUBLIC S3 bucket (openfold3-data, unsigned
+    # requests), so this needs no credentials. Baking them makes the image
+    # self-contained: no download, and no interactive "(yes/no)" prompt on
+    # first use. Writing ckpt_root here too means nothing has to be written
+    # into the read-only image at run time.
+    if [ "{{ BAKE_WEIGHTS }}" = "yes" ]; then
+        echo "baking OpenFold3 parameters into the image..."
+        # Not `setup_openfold`: that ignores $OPENFOLD_CACHE and writes to
+        # ~/.openfold3 regardless, so call the download routine it uses directly.
+        $OF3/python - /opt/openfold3 openfold3-p2-155k <<'PY'
+import sys
+from pathlib import Path
+from openfold3.entry_points.parameters import download_model_parameters
+d = Path(sys.argv[1])
+download_model_parameters(d, sys.argv[2], skip_confirmation=True)
+(d / "ckpt_root").write_text(str(d) + "\n")
+PY
+        chmod -R a+rX /opt/openfold3
+        ls -lh /opt/openfold3
+        sz=$(stat -c %s /opt/openfold3/of3-p2-155k.pt 2>/dev/null || echo 0)
+        [ "$sz" -ge 1000000000 ] || \
+            { echo "ERROR: parameter download produced no complete checkpoint ($sz bytes)" >&2; exit 1; }
+    else
+        echo "slim build: OpenFold3 parameters will be fetched to \$OPENFOLD_CACHE on first use"
+    fi
+
+    # Fail the build now rather than at 3am in a job: every piece must import/run.
+    vina --version
+    obabel -V
+    /opt/conda/envs/docking/bin/python -c \
+        'import rdkit, Bio, numpy, pandas, yaml; from rdkit.Chem import AllChem, rdDetermineBonds; print("scoring env OK", rdkit.__version__)'
+    /opt/conda/envs/docking/bin/python /opt/docking/docking.py --help > /dev/null
+    /opt/conda/envs/docking/bin/python /opt/docking/make_query.py --help > /dev/null
+    # openfold3 exposes no __version__ attribute; its own code reads the
+    # distribution metadata, so do the same here.
+    $OF3/python -c 'import torch, openfold3, importlib.metadata as md; print("of3 env OK", torch.__version__, md.version("openfold3"))'
+    $OF3/run_openfold --help > /dev/null
+    echo "ALL BUILD CHECKS PASSED"
+
+%runscript
+    exec /opt/docking/run_pipeline.sh "$@"
+
+%help
+    OpenFold3 co-folding + AutoDock Vina binding scores, in one image.
+
+    BUILD
+        cd <this repo>
+        mkdir -p weights && cp /path/to/of3-p2-155k.pt weights/
+        APPTAINER_TMPDIR=/var/tmp apptainer build --fakeroot docking_of3.sif docking_of3.def
+
+        The build needs ~40 GB of scratch in APPTAINER_TMPDIR; point it somewhere
+        with room. The finished image is roughly 12-15 GB (2.3 GB of that is the
+        OpenFold3 checkpoint).
+
+    MODE 1 - fold a complex, then score it (needs --nv and internet for MSAs)
+
+        apptainer run --nv docking_of3.sif --name gsh \
+            --fasta MNPISRSFSHRIIGSRSLDSVLFSPREARSTFPDLENFRIAKLHGFRRVFAHS... \
+            --smiles 'SC[C@@H](C(=O)NCC(=O)O)NC(=O)CC[C@@H](C(=O)O)N' \
+            --output-dir results/
+
+        --fasta takes the protein sequence itself, or a path to a FASTA file:
+
+        apptainer run --nv docking_of3.sif --fasta protein.fa --smiles 'CCO'
+
+        OpenFold3 co-folds EXACTLY ONE structure (1 model seed, 1 diffusion
+        sample), which is then scored. Use --fold-only to stop after folding.
+
+        --nv is required for GPU access and must be given on this outer command;
+        it cannot be requested from inside the container.
+
+    MODE 2 - score a protein-ligand structure you already have
+             (no GPU, no network required)
+
+        apptainer run docking_of3.sif --cif my_model.cif
+        apptainer run docking_of3.sif --cif af3_output/ --output-dir results/
+
+        AlphaFold3, OpenFold3 and Boltz CIFs all work with no extra flags: the
+        ligand SMILES is recovered from the CIF itself (AlphaFold3), the query
+        JSON (OpenFold3) or the input YAML (Boltz). For a structure with none of
+        those nearby, give it explicitly:
+
+        apptainer run docking_of3.sif --cif complex.cif \
+            --smiles 'c1ccccc1' --ligand-chain B
+
+    EXTRA VINA OPTIONS
+        Everything after a bare -- goes straight to docking.py:
+
+        apptainer run docking_of3.sif --cif model.cif -- --dock --exhaustiveness 32
+
+    OUTPUT
+        <output-dir>/vina_scores.csv   one row per structure
+        <output-dir>/vina_work/<name>/ poses, PDBQT files, per-run result.json
+
+        Each run reports vina_score_only (the pose exactly as predicted) and
+        vina_local_min (after relaxing in place, with how far it moved). A
+        positive score_only means the predicted pose clashes.
+
+    NOTES
+        * MSAs come from the ColabFold server by default, so Mode 1 needs outbound
+          internet. Use --no-msa-server for single-sequence mode (faster, less
+          accurate), or supply your own alignments in a --query-json.
+        * The scorer rebuilds the ligand's bond orders from its SMILES, because a
+          CIF stores no bond orders and reading one without a template turns every
+          C=O into C-OH. Check the printed molecular formula on each run: it is the
+          cheapest proof the right molecule was scored.

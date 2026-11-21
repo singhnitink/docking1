@@ -1,0 +1,23 @@
+# container image and model parameters - gigabytes, never in git
+*.sif
+weights/
+
+# run outputs (default locations of docking.py, run_pipeline.sh and the CI smoke test)
+docking_output/
+vina_work/
+openfold_results/
+of3_output/
+vina_scores.csv
+*.pdbqt
+*.log
+smoke/
+
+# python
+__pycache__/
+*.pyc
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

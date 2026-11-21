@@ -1,561 +1,832 @@
+#!/usr/bin/env python
+"""
+AutoDock Vina scoring of ligand poses from co-folded structures
+(AlphaFold3, OpenFold3 or Boltz).
 
+For each CIF this:
 
-# GOOGLE COLAB SETUP:
+  1. finds the ligand chain(s) and the ligand SMILES. AlphaFold3 stores the SMILES
+     in the CIF itself; OpenFold3 and Boltz keep it in the input JSON / YAML that
+     sits beside or above the output, which is searched for automatically,
+  2. splits the complex into receptor (everything except the ligand chain) and ligand,
+  3. rebuilds the ligand with correct bond orders / formal charges using that SMILES
+     as a template.  THIS IS THE STEP THAT MATTERS: a CIF/PDB stores no bond orders,
+     so reading the ligand without a template turns every C=O into C-OH and silently
+     scores the wrong molecule.  The predicted coordinates are kept exactly; only
+     chemistry is restored.  Predicted stereochemistry is checked against the SMILES,
+  4. prepares PDBQT files (Open Babel; receptor protonated at --ph),
+  5. runs Vina:
+       score_only : score of the pose as predicted (no movement)
+       local_only : score after local minimisation in place (+ RMSD moved)
+       dock       : optional (--dock) redock in a box around the predicted pose,
+                    reporting best score and each pose's RMSD to the predicted pose,
+  6. prints a summary and (for >1 structure, or with -o) writes one CSV row each.
+     A complex with several ligand chains gets one row per chain, the other
+     ligands being treated as part of the receptor.
 
-# Before running this script in a Google Colab notebook,execute the following commands in a Colab cell to install dependencies:
-#
-# !apt-get update
+Usage
+  python docking.py gsh_model.cif
+  python docking.py gsh_model.cif --dock --keep_files
+  python docking.py af_output/ -o scores.csv -j 8
 
-# !apt-get install -y openbabel autodock-vina wget
-#!pip install "numpy<3.0"
-#!pip install biopython rdkit-pypi mdanalysis MDAnalysisTests
+Requires: rdkit, biopython, numpy (pyyaml for Boltz input files);
+`vina` (>=1.2) and `obabel` on PATH.
 
+Note on protonation: the ligand is built exactly as the folded SMILES specifies, so
+it is scored in the same protonation state the predictor saw.  If that SMILES is the
+neutral form of an acid or base, the ligand is scored neutral while the receptor is
+protonated at --ph.  Vina's scoring function ignores partial charges, so this only
+affects H-bond donor/acceptor typing -- but keep it in mind when comparing different
+ligands to each other.
+"""
 
 import argparse
+import csv
+import fcntl
+import glob
+import hashlib
+import json
 import os
+import re
+import shutil
+import string
 import subprocess
 import sys
-import shutil
-import re
+import traceback
+from concurrent.futures import ProcessPoolExecutor
 
-# Try to import necessary libraries and provide guidance if they are missing.
-try:
-    from Bio.PDB import MMCIFParser, PDBIO, Select
-    from Bio.PDB.Residue import Residue
-    from Bio.PDB.Atom import Atom
-    from Bio.PDB import Structure as BioPDBStructure # Alias to avoid conflict
-    from Bio.PDB import Model as BioPDBModel
-    from Bio.PDB import Chain as BioPDBChain
-except ImportError:
-    print("Error: Biopython not found. Please ensure it's installed (e.g., pip install biopython).")
-    print("In Colab, run: !pip install biopython after ensuring numpy<2.0 is installed.")
-    sys.exit(1)
+import numpy as np
+from Bio.PDB import MMCIFParser, PDBIO, Select
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, rdDetermineBonds
 
-try:
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-except ImportError:
-    print("Error: RDKit not found. Please ensure it's installed (e.g., pip install rdkit-pypi).")
-    print("In Colab, run: !pip install rdkit-pypi after ensuring numpy<2.0 is installed.")
-    sys.exit(1)
+RDLogger.DisableLog("rdApp.*")
 
-try:
-    import MDAnalysis as mda
-    from MDAnalysis.exceptions import NoDataError
-except ImportError:
-    print("Error: MDAnalysis not found. Please ensure it's installed (e.g., pip install mdanalysis MDAnalysisTests).")
-    print("In Colab, run: !pip install mdanalysis MDAnalysisTests after ensuring numpy<2.0 is installed.")
-    sys.exit(1)
+VINA = "vina"
+OBABEL = "obabel"
 
-try:
-    import numpy as np
-except ImportError:
-    print("Error: NumPy not found. Please ensure it's installed (e.g., pip install \"numpy<2.0\").")
-    print("In Colab, run: !pip install \"numpy<2.0\"")
-    sys.exit(1)
+# AutoDock atom type -> element
+AD2ELEM = {"A": "C", "C": "C", "OA": "O", "O": "O", "NA": "N", "N": "N", "NS": "N",
+           "SA": "S", "S": "S", "HD": "H", "H": "H", "HS": "H", "F": "F", "Cl": "Cl",
+           "CL": "Cl", "Br": "Br", "BR": "Br", "I": "I", "P": "P", "MG": "Mg",
+           "ZN": "Zn", "MN": "Mn", "CA": "Ca", "FE": "Fe"}
+
+CSV_FIELDS = [
+    "name", "status", "error",
+    "vina_score_only", "vina_local_min", "local_min_rmsd",
+    "dock_best", "dock_best_rmsd", "dock_best_within_2A", "dock_rmsd_of_best_within_2A",
+    "n_heavy", "formula", "formal_charge", "stereo_ok", "stereo_note",
+    "ligand_chain", "ligand_comp", "smiles", "smiles_as_built", "smiles_source",
+    "af3_ranking_score", "af3_ptm", "af3_iptm", "af3_ligand_chain_iptm", "af3_has_clash",
+    "cif", "workdir",
+]
+
+BIND_HINT = ("inside a container only $HOME, the working directory and /tmp are "
+             "visible by default; anything else needs --bind <path>")
 
 
-# --- Configuration ---
-# Path to executables (should be in PATH after Colab installation)
-OBABEL_EXECUTABLE = "obabel"
-VINA_EXECUTABLE = "vina"
-
-# Default names for intermediate and output files
-PROTEIN_PDB = "protein.pdb"
-LIGAND_PDB = "ligand.pdb"
-LIGAND_H_PDB = "ligand_h.pdb" # Ligand with hydrogens from RDKit
-LIGAND_PDBQT = "ligand.pdbqt"
-
-PROTEIN_H_PDB = "protein_h.pdb" # Protein with hydrogens from OpenBabel
-PROTEIN_PDBQT = "protein.pdbqt"
-
-VINA_CONFIG_FILE = "vina_config.txt"
-VINA_OUT_PDBQT = "docked_ligand.pdbqt"
-VINA_LOG_FILE = "vina_run.log" # Vina output will be redirected here
+def warn(msg):
+    print(msg, file=sys.stderr, flush=True)
 
 
-
-def check_executables():
-    """Checks if OpenBabel and Vina are accessible."""
-    if not shutil.which(OBABEL_EXECUTABLE):
-        print(f"Error: OpenBabel ('{OBABEL_EXECUTABLE}') not found in PATH.")
-        print("Please ensure it's installed. In Colab, run the setup cells at the top of the script.")
-        sys.exit(1)
-    if not shutil.which(VINA_EXECUTABLE):
-        print(f"Error: AutoDock Vina ('{VINA_EXECUTABLE}') not found in PATH.")
-        print("Please ensure it's installed. In Colab, run the setup cells at the top of the script.")
-        sys.exit(1)
-    print("Found OpenBabel and Vina executables in PATH.")
-
-class NonHetSelect(Select):
-    """Selects non-heteroatoms (protein)."""
-    def accept_residue(self, residue):
-        return residue.id[0] == ' '
-
-class HetSelect(Select):
-    """Selects heteroatoms (ligand/cofactors), excluding water."""
-    def __init__(self, ligand_resname=None):
-        self.ligand_resname = ligand_resname
-
-    def accept_residue(self, residue):
-        is_het = residue.id[0].startswith('H_')
-        is_water = residue.get_resname().strip() in ['HOH', 'WAT']
-        
-        if self.ligand_resname:
-            return is_het and not is_water and residue.get_resname().strip() == self.ligand_resname
+# --------------------------------------------------------------------------------------
+# input discovery
+# --------------------------------------------------------------------------------------
+def find_cifs(inputs):
+    """Every *.cif under each directory. AlphaFold3 writes <job>_model.cif, Boltz
+    <job>_model_N.cif and OpenFold3 <query>_seed_N_sample_M_model.cif; a file that is
+    not a structure is rejected later, loudly, rather than skipped here, silently."""
+    cifs = []
+    for p in inputs:
+        if os.path.isfile(p):
+            cifs.append(p)
+        elif os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for f in files:
+                    if f.lower().endswith(".cif"):
+                        cifs.append(os.path.join(root, f))
         else:
-            return is_het and not is_water
+            sys.exit(f"no such file or directory: {p}\n  ({BIND_HINT})")
+    return sorted(set(os.path.abspath(c) for c in cifs))
 
-def parse_cif_to_pdb(cif_filepath, protein_out_pdb, ligand_out_pdb, target_ligand_resname=None):
+
+def job_name(cif):
+    """A label unique to the file: gsh_model.cif -> gsh; A208K_model_0.cif -> A208K_model_0;
+    seed-1_sample-0/model.cif -> <job>_seed-1_sample-0."""
+    base = os.path.basename(cif)
+    if base == "model.cif":
+        d = os.path.basename(os.path.dirname(cif))
+        parent = os.path.basename(os.path.dirname(os.path.dirname(cif)))
+        return f"{parent}_{d}" if parent else d
+    return re.sub(r"_model$", "", os.path.splitext(base)[0])
+
+
+def base_name(cif):
+    """The job / query the file belongs to, every predictor's suffix stripped:
+    gsh_model.cif -> gsh;  A208K_model_0.cif -> A208K;
+    alginate_seed_42_sample_1_model.cif -> alginate;  <job>/seed-1_sample-0/model.cif -> <job>."""
+    n = job_name(cif)
+    n = re.sub(r"_model(_\d+)?$", "", n)
+    n = re.sub(r"_seed[-_]\d+_sample[-_]\d+$", "", n)
+    return n
+
+
+def workdir_tag(cif):
+    """Readable, but unique per *file*: two structures that share a basename must
+    never share a working directory, or they overwrite each other's PDBQT files."""
+    h = hashlib.sha1(os.path.abspath(cif).encode()).hexdigest()[:6]
+    return f"{job_name(cif)}-{h}"
+
+
+def placeholder_ancestors(path):
+    """Directories above the CIF's directory whose ONLY entry is the next step of
+    the path. That is what Apptainer leaves when it binds just the working
+    directory: the path to it exists, but every level above the leaf is a bare
+    placeholder, so an input file one level up is invisible inside the container."""
+    out = []
+    child = os.path.dirname(os.path.abspath(path))
+    d = os.path.dirname(child)
+    for _ in range(6):
+        if d == child:
+            break
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            break
+        if entries != [os.path.basename(child)]:
+            break
+        out.append(d)
+        child, d = d, os.path.dirname(d)
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# ligand identity
+# --------------------------------------------------------------------------------------
+def _as_list(d, key):
+    v = d.get(key, [])
+    return v if isinstance(v, list) else [v]
+
+
+def read_cif(cif):
+    """Parse an AlphaFold3 / OpenFold3 / Boltz CIF -> (first model, mmcif dict).
+
+    OpenFold3 omits _atom_site.occupancy, which Biopython's MMCIFParser requires,
+    so fill in the columns it assumes before handing the dict over.
     """
-    Parses a CIF file, separates protein and a specified ligand (or first HETATM),
-    and saves them as PDB files.
+    d = MMCIF2Dict(cif)
+    n = len(_as_list(d, "_atom_site.id"))
+    if not n:
+        raise ValueError(f"no _atom_site records in {cif} (not a structure file?)")
+    for key, default in (("_atom_site.occupancy", "1.00"),
+                         ("_atom_site.label_alt_id", "."),
+                         ("_atom_site.pdbx_PDB_model_num", "1"),
+                         ("_atom_site.B_iso_or_equiv", "0.00")):
+        if key not in d:
+            d[key] = [default] * n
+    p = MMCIFParser(QUIET=True)
+    p._mmcif_dict = d
+    p._build_structure("c")
+    return next(iter(p._structure_builder.get_structure())), d
+
+
+def ligand_from_cif(d):
+    """-> list of (comp_id, chain, smiles or None) for every non-polymer component.
+
+    AlphaFold3 stores the ligand SMILES in the CIF (_chem_comp.pdbx_smiles).
+    OpenFold3 and Boltz do not, but do mark the ligand chain via _entity /
+    _struct_asym, so the chain is found here and the SMILES comes from the input file.
     """
-    print(f"Parsing CIF file: {cif_filepath}")
-    parser = MMCIFParser(QUIET=True)
-    try:
-        structure = parser.get_structure("complex", cif_filepath)
-    except Exception as e:
-        print(f"Error parsing CIF file {cif_filepath}: {e}")
-        sys.exit(1)
+    ids = _as_list(d, "_chem_comp.id")
+    smis = _as_list(d, "_chem_comp.pdbx_smiles")
+    typs = _as_list(d, "_chem_comp.type")
+    smap = {}
+    for i, c in enumerate(ids):
+        t = typs[i].lower() if i < len(typs) else ""
+        s = smis[i] if i < len(smis) else "?"
+        if "non-polymer" in t and s not in ("?", ".", ""):
+            smap[c] = s
+
+    ent_type = dict(zip(_as_list(d, "_entity.id"), _as_list(d, "_entity.type")))
+    nonpoly_chains = {a for a, e in zip(_as_list(d, "_struct_asym.id"),
+                                        _as_list(d, "_struct_asym.entity_id"))
+                      if "non-polymer" in ent_type.get(e, "").lower()}
+    nonpoly_chains |= set(_as_list(d, "_pdbx_nonpoly_scheme.asym_id"))
+
+    comps = _as_list(d, "_atom_site.label_comp_id")
+    labs = _as_list(d, "_atom_site.label_asym_id")
+    auths = _as_list(d, "_atom_site.auth_asym_id") or labs
+    out, seen = [], set()
+    for c, lab, ch in zip(comps, labs, auths):
+        if (c in smap or lab in nonpoly_chains or ch in nonpoly_chains) and (c, ch) not in seen:
+            seen.add((c, ch))
+            out.append((c, ch, smap.get(c)))
+    return out
+
+
+def _source_name(j, path):
+    """The job a predictor input file belongs to: its "name" field if it has one,
+    else the file's stem (Boltz: A208K.yaml; AlphaFold3: gsh_data.json)."""
+    n = j.get("name")
+    if isinstance(n, str) and n.strip():
+        return n.strip()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return re.sub(r"_data$", "", stem)
+
+
+def _smiles_from_input_obj(j, path, chain, base):
+    """Pull the ligand SMILES for `chain` out of a predictor input file, but ONLY
+    if that file belongs to the same job as the CIF. Chain "B" is the default
+    ligand chain for every predictor, so without this check any stray input file
+    nearby would silently redefine the molecule being scored."""
+    # AlphaFold3 / Boltz: {"name": ..., "sequences": [{"ligand": {"id": [...], "smiles": ...}}]}
+    seqs = j.get("sequences")
+    if isinstance(seqs, list) and _source_name(j, path).lower() == base.lower():
+        for s in seqs:
+            lig = s.get("ligand") if isinstance(s, dict) else None
+            if not lig or not lig.get("smiles"):
+                continue
+            ids = lig["id"] if isinstance(lig["id"], list) else [lig["id"]]
+            if chain is None or chain in ids:
+                return lig["smiles"]
+    # OpenFold3: {"queries": {"<name>": {"chains": [{"molecule_type": "ligand",
+    #             "chain_ids": [...], "smiles": ...}]}}}  -- the key is the job name
+    queries = j.get("queries") or {}
+    for qn, q in queries.items():
+        if qn != base:
+            continue
+        for ch in (q or {}).get("chains", []) or []:
+            # OpenFold3's own inference_query_set.json spells this "LIGAND"
+            if (ch.get("molecule_type") or "").lower() != "ligand" or not ch.get("smiles"):
+                continue
+            ids = ch.get("chain_ids") or []
+            if chain is None or chain in ids or not ids:
+                return ch["smiles"]
+    return None
+
+
+def _load_input_file(path):
+    """Load an AlphaFold3/OpenFold3 JSON or a Boltz YAML into a dict."""
+    if path.endswith((".yaml", ".yml")):
+        try:
+            import yaml
+        except ImportError:
+            return None
+        with open(path) as fh:
+            return yaml.safe_load(fh)
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def smiles_from_input(cif, chain):
+    """Search beside and above the CIF for the input file that defined this ligand.
+    -> (smiles, path) or (None, None).
+
+    AlphaFold3: <job>_data.json / fold_input.json beside the CIF.
+    OpenFold3:  inference_query_set.json two levels up, or the query JSON given to
+                run_openfold a few levels up.
+    Boltz:      <job>.yaml above boltz_results_*/.
+    """
+    base = base_name(cif)
+    seen = set()
+    d = os.path.dirname(os.path.abspath(cif))
+    for _ in range(6):
+        cands = []
+        for pat in ("*.json", "*.yaml", "*.yml"):
+            cands += sorted(glob.glob(os.path.join(d, pat)))
+        for sub in sorted(glob.glob(os.path.join(d, "*json*"))):
+            if os.path.isdir(sub):
+                cands += sorted(glob.glob(os.path.join(sub, "*.json")))
+        for p in cands:
+            if p in seen or not os.path.isfile(p):
+                continue
+            seen.add(p)
+            try:
+                if os.path.getsize(p) > 512 * 1024 * 1024:
+                    continue
+                j = _load_input_file(p)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            s = _smiles_from_input_obj(j, p, chain, base)
+            if s:
+                return s, p
+        d = os.path.dirname(d)
+    return None, None
+
+
+def af3_metadata(cif, chain):
+    """<job>_summary_confidences.json, if AlphaFold3 wrote one next to the CIF."""
+    d = os.path.dirname(os.path.abspath(cif))
+    for cand in (f"{job_name(cif)}_summary_confidences.json", "summary_confidences.json"):
+        p = os.path.join(d, cand)
+        if not os.path.isfile(p):
+            continue
+        try:
+            j = json.load(open(p))
+        except Exception:
+            return {}
+        out = {"af3_ranking_score": j.get("ranking_score"), "af3_ptm": j.get("ptm"),
+               "af3_iptm": j.get("iptm"), "af3_has_clash": j.get("has_clash")}
+        ids, ci = j.get("chain_ids"), j.get("chain_iptm")
+        if ids and ci and chain in ids:
+            out["af3_ligand_chain_iptm"] = ci[ids.index(chain)]
+        return out
+    return {}
+
+
+# --------------------------------------------------------------------------------------
+# structure preparation
+# --------------------------------------------------------------------------------------
+class SkipLigand(Exception):
+    """Not a failure: nothing here that Vina can meaningfully score."""
+
+
+class ReceptorSelect(Select):
+    """Everything except the ligand chain and solvent."""
+
+    def __init__(self, lig_chain):
+        self.lig_chain = lig_chain
+
+    def accept_chain(self, chain):
+        return chain.id != self.lig_chain
+
+    def accept_residue(self, res):
+        return res.get_resname().strip() not in ("HOH", "WAT", "DOD")
+
+
+def split_complex(model, lig_chain, receptor_pdb):
+    """Write the receptor PDB; return the ligand's heavy-atom elements and coordinates."""
+    if lig_chain not in model:
+        raise ValueError(f"ligand chain {lig_chain} not in CIF (chains: {[c.id for c in model]})")
+
+    # PDB format allows only 1-character chain IDs; AlphaFold3 can emit longer ones.
+    longs = [c for c in model if len(c.id.strip()) > 1 and c.id != lig_chain]
+    if longs:
+        free = [x for x in string.ascii_uppercase + string.digits
+                if x not in {c.id for c in model}]
+        for c in longs:
+            if not free:
+                raise ValueError("too many chains to remap into PDB single-character IDs")
+            c.id = free.pop(0)
 
     io = PDBIO()
-    io.set_structure(structure)
+    io.set_structure(model)
+    io.save(receptor_pdb, ReceptorSelect(lig_chain))
 
-    print(f"Saving protein to {protein_out_pdb}")
-    io.save(protein_out_pdb, NonHetSelect())
-
-    found_ligand_residue = None
-    # Prioritize specified ligand name
-    if target_ligand_resname:
-        for model in structure:
-            for chain in model:
-                for residue in chain:
-                    if residue.id[0].startswith('H_') and \
-                       residue.get_resname().strip() == target_ligand_resname and \
-                       residue.get_resname().strip() not in ['HOH', 'WAT']:
-                        found_ligand_residue = residue
-                        break
-                if found_ligand_residue: break
-            if found_ligand_residue: break
-        
-        if not found_ligand_residue:
-            print(f"Warning: Specified ligand residue name '{target_ligand_resname}' not found as a non-water HETATM.")
-            print("Attempting to find any non-water HETATM as ligand...")
-    
-    # If no specific ligand or specified not found, find first non-water HETATM
-    if not found_ligand_residue:
-        for model in structure:
-            for chain in model:
-                for residue in chain:
-                    if HetSelect().accept_residue(residue): # Generic check for non-water HETATM
-                        found_ligand_residue = residue
-                        print(f"Found generic HETATM: {residue.get_resname().strip()} in chain {chain.id}, residue ID {residue.id}")
-                        break
-                if found_ligand_residue: break
-            if found_ligand_residue: break
-
-    if found_ligand_residue:
-        original_full_resname = found_ligand_residue.get_resname().strip()
-        
-        pdb_compatible_resname = original_full_resname.upper()
-        if len(original_full_resname) > 3:
-            pdb_compatible_resname = original_full_resname[:3].upper() 
-            print(f"Warning: Original ligand residue name '{original_full_resname}' ({len(original_full_resname)} chars) is longer than 3 characters. "
-                  f"Using truncated name '{pdb_compatible_resname}' for the intermediate PDB file for RDKit compatibility.")
-        
-        print(f"Saving ligand ({original_full_resname}) to {ligand_out_pdb} using PDB resname '{pdb_compatible_resname}' for internal PDB.")
-        
-        lig_struct = BioPDBStructure.Structure("ligand_only")
-        lig_model = BioPDBModel.Model(0)
-        lig_chain = BioPDBChain.Chain('L') 
-        
-        hetflag = 'H_' + pdb_compatible_resname 
-        new_residue_id = (hetflag, found_ligand_residue.id[1], found_ligand_residue.id[2])
-
-        copied_residue = Residue(new_residue_id, pdb_compatible_resname, found_ligand_residue.segid)
-        for atom_obj in found_ligand_residue: 
-            copied_atom = Atom(atom_obj.name, atom_obj.coord, atom_obj.bfactor, atom_obj.occupancy, atom_obj.altloc,
-                               atom_obj.fullname, atom_obj.serial_number, element=atom_obj.element)
-            copied_residue.add(copied_atom)
-
-        lig_chain.add(copied_residue)
-        lig_model.add(lig_chain)
-        lig_struct.add(lig_model)
-        
-        tmp_io = PDBIO()
-        tmp_io.set_structure(lig_struct)
-        tmp_io.save(ligand_out_pdb)
-        return ligand_out_pdb, original_full_resname 
-    else:
-        print("Error: No suitable ligand (non-water HETATM) found in the CIF file.")
-        print("If your ligand is a standard residue or part of a polymer, this script may need modification.")
-        sys.exit(1)
+    elems, xyz = [], []
+    for atom in model[lig_chain].get_atoms():
+        e = (atom.element or atom.get_id()[0]).strip().capitalize()
+        if e in ("H", "D"):
+            continue
+        elems.append(e)
+        xyz.append(atom.coord.astype(float))
+    if not elems:
+        raise ValueError(f"no atoms in ligand chain {lig_chain}")
+    return elems, np.array(xyz)
 
 
-def prepare_ligand_pdbqt(ligand_pdb_in, ligand_pdbqt_out):
-    """
-    Prepares ligand PDBQT:
-    1. Reads PDB, adds hydrogens with RDKit, saves as ligand_h.pdb.
-    2. Converts ligand_h.pdb to PDBQT using OpenBabel.
-    """
-    print(f"Preparing ligand: {ligand_pdb_in} -> {ligand_pdbqt_out}")
+def mol_from_xyz(elems, xyz):
+    rw = Chem.RWMol()
+    for e in elems:
+        rw.AddAtom(Chem.Atom(e))
+    conf = Chem.Conformer(len(elems))
+    for i, p in enumerate(xyz):
+        conf.SetAtomPosition(i, p.tolist())
+    rw.AddConformer(conf, assignId=True)
+    m = rw.GetMol()
+    rdDetermineBonds.DetermineConnectivity(m)
+    # DetermineConnectivity marks atoms NoImplicit; clear so H counts follow template bond orders
+    for a in m.GetAtoms():
+        a.SetNoImplicit(False)
+        a.SetNumRadicalElectrons(0)
+    m.UpdatePropertyCache(strict=False)
+    return m
+
+
+def template_from_smiles(smiles):
+    t = Chem.MolFromSmiles(smiles)
+    if t is None:
+        raise ValueError(f"RDKit cannot parse SMILES {smiles}")
+    frags = Chem.GetMolFrags(t, asMols=True)
+    note = ""
+    if len(frags) > 1:  # keep largest fragment (drops counter-ions)
+        t = max(frags, key=lambda f: f.GetNumHeavyAtoms())
+        note = "multi-fragment SMILES: kept largest fragment"
+    return t, note
+
+
+def build_ligand(elems, xyz, smiles):
+    """Restore bond orders/charges/hydrogens onto the predicted coordinates.
+    -> (mol with H, stereo_ok, note, smiles_as_built)"""
+    template, note = template_from_smiles(smiles)
+    probe = mol_from_xyz(elems, xyz)
+
+    # if the CIF ligand chain has extra fragments (counter-ions), keep the biggest
+    if len(Chem.GetMolFrags(probe)) > 1:
+        frags = Chem.GetMolFrags(probe, asMols=True, sanitizeFrags=False)
+        probe = max(frags, key=lambda f: f.GetNumAtoms())
+    if probe.GetNumAtoms() != template.GetNumHeavyAtoms():
+        raise ValueError(f"heavy atom count mismatch: CIF {probe.GetNumAtoms()} vs SMILES "
+                         f"{template.GetNumHeavyAtoms()} (bad geometry or wrong SMILES)")
     try:
-        mol = Chem.MolFromPDBFile(ligand_pdb_in, removeHs=False, sanitize=False)
-        if mol is None:
-            print(f"Error: RDKit could not read ligand PDB: {ligand_pdb_in}")
-            if os.path.exists(ligand_pdb_in):
-                print(f"Contents of problematic {ligand_pdb_in} (first 10 lines):")
-                try:
-                    with open(ligand_pdb_in, 'r') as f_err:
-                        for i, line in enumerate(f_err):
-                            if i < 10:
-                                print(line.strip())
-                            else:
-                                break
-                except Exception as e_read:
-                    print(f"Could not read {ligand_pdb_in}: {e_read}")
-            else:
-                print(f"{ligand_pdb_in} does not exist.")
-            sys.exit(1)
-        
-        mol = Chem.RemoveHs(mol) 
-        mol_h = Chem.AddHs(mol, addCoords=True) 
-        if mol_h is None:
-            print("Error: RDKit failed to add hydrogens to ligand.")
-            sys.exit(1)
-        
-        Chem.MolToPDBFile(mol_h, LIGAND_H_PDB)
-        print(f"Ligand with RDKit hydrogens saved to: {LIGAND_H_PDB}")
-
+        mol = AllChem.AssignBondOrdersFromTemplate(template, probe)
     except Exception as e:
-        print(f"Error during RDKit processing of ligand '{ligand_pdb_in}': {e}")
-        sys.exit(1)
+        raise ValueError(f"could not map SMILES onto predicted ligand graph "
+                         f"(distorted geometry?): {e}")
+    Chem.SanitizeMol(mol)
+    if Chem.MolToSmiles(mol, isomericSmiles=False) != Chem.MolToSmiles(template, isomericSmiles=False):
+        raise ValueError("ligand chemistry after bond-order assignment differs from SMILES")
+
+    # stereo check: compare only centres actually specified in the SMILES
+    Chem.AssignStereochemistryFrom3D(mol)
+    match = mol.GetSubstructMatch(template)
+    want = dict(Chem.FindMolChiralCenters(template, includeUnassigned=False,
+                                          useLegacyImplementation=False))
+    got = dict(Chem.FindMolChiralCenters(mol, includeUnassigned=True,
+                                         useLegacyImplementation=False))
+    bad = [f"{i}:{lab}->{got.get(match[i], '?')}" for i, lab in want.items()
+           if got.get(match[i]) != lab]
+    unspec = [i for i, lab in Chem.FindMolChiralCenters(template, includeUnassigned=True,
+                                                        useLegacyImplementation=False) if lab == "?"]
+    notes = [note]
+    if bad:
+        notes.append("flipped " + ",".join(bad))
+    if unspec:
+        notes.append(f"unspecified stereocentre(s) in SMILES at {unspec}: "
+                     f"folded as an arbitrary isomer")
+    # what was actually scored, stereo taken from the 3D coordinates
+    as_built = Chem.MolToSmiles(mol)
+    return Chem.AddHs(mol, addCoords=True), (not bad), "; ".join(filter(None, notes)), as_built
+
+
+def run(cmd, cwd):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} failed:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}")
+    return p.stdout + p.stderr
+
+
+def prep_receptor(receptor_pdb, out_pdbqt, ph, cwd):
+    run([OBABEL, receptor_pdb, "-O", out_pdbqt, "-xr", "-p", str(ph)], cwd)
+    if not os.path.getsize(os.path.join(cwd, out_pdbqt)):
+        raise RuntimeError("empty receptor pdbqt")
+
+
+def prep_ligand(sdf, out_pdbqt, cwd):
+    # hydrogens/charges already set from the SMILES; obabel only types atoms + Gasteiger charges
+    run([OBABEL, sdf, "-O", out_pdbqt, "--partialcharge", "gasteiger"], cwd)
+    if not os.path.getsize(os.path.join(cwd, out_pdbqt)):
+        raise RuntimeError("empty ligand pdbqt")
+
+
+# --------------------------------------------------------------------------------------
+# Vina + RMSD
+# --------------------------------------------------------------------------------------
+ENERGY_RE = re.compile(r"Estimated Free Energy of Binding\s*:\s*(-?\d+\.\d+)")
+
+
+def vina_energy(out):
+    m = ENERGY_RE.search(out)
+    if not m:
+        raise RuntimeError(f"could not parse Vina energy:\n{out[-1500:]}")
+    return float(m.group(1))
+
+
+def read_pdbqt_models(path):
+    """list of (affinity or None, [(elem, xyz), ...]) per MODEL, atom order preserved."""
+    models, cur, aff = [], [], None
+    for line in open(path):
+        if line.startswith("MODEL"):
+            cur, aff = [], None
+        elif line.startswith("REMARK VINA RESULT"):
+            aff = float(line.split()[3])
+        elif line.startswith(("ATOM", "HETATM")):
+            t = line[77:79].strip()
+            cur.append((AD2ELEM.get(t.upper(), t),
+                        np.array([float(line[30:38]), float(line[38:46]), float(line[46:54])])))
+        elif line.startswith("ENDMDL"):
+            models.append((aff, cur))
+    if not models and cur:
+        models.append((aff, cur))
+    return models
+
+
+class PoseRMSD:
+    """Symmetry-aware heavy-atom RMSD (no superposition) to the predicted pose."""
+
+    def __init__(self, molH, input_pdbqt):
+        heavy = Chem.RemoveHs(molH)
+        self.ref = heavy.GetConformer().GetPositions()
+        self.autos = heavy.GetSubstructMatches(heavy, uniquify=False, useChirality=False,
+                                               maxMatches=100000)
+        # map pdbqt heavy-atom order -> rdkit heavy-atom index via identical input coordinates
+        atoms = [a for a in read_pdbqt_models(input_pdbqt)[0][1] if a[0] != "H"]
+        if len(atoms) != len(self.ref):
+            raise RuntimeError(f"pdbqt heavy atoms {len(atoms)} != ligand {len(self.ref)}")
+        self.order = []
+        for _, p in atoms:
+            d = np.linalg.norm(self.ref - p, axis=1)
+            j = int(np.argmin(d))
+            if d[j] > 0.05:
+                raise RuntimeError("could not map pdbqt atoms to ligand atoms")
+            self.order.append(j)
+        if len(set(self.order)) != len(self.order):
+            raise RuntimeError("non-unique pdbqt->ligand atom mapping")
+
+    def __call__(self, pose_atoms):
+        heavy = [p for e, p in pose_atoms if e != "H"]
+        pos = np.empty_like(self.ref)
+        for k, j in enumerate(self.order):
+            pos[j] = heavy[k]
+        # automorphism t maps ref atom i -> equivalent atom t[i]
+        return min(float(np.sqrt(np.mean(np.sum((self.ref - pos[list(t)]) ** 2, axis=1))))
+                   for t in self.autos)
+
+
+# --------------------------------------------------------------------------------------
+# per-structure job
+# --------------------------------------------------------------------------------------
+def _file_sha1(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _score_chain(cif, wd, a, model, chain, comp, smiles, source, cif_sha, name):
+    """Score one ligand chain of one structure. Returns the result row."""
+    row = {"name": name, "cif": cif, "workdir": wd, "ligand_chain": chain,
+           "ligand_comp": comp, "smiles": smiles, "smiles_source": source}
+    # Cache key: every setting that changes the numbers, the CIF's content, AND the
+    # ligand definition. Fixing a protonation state or a stereocentre in the input
+    # file and re-scoring is a routine workflow; it must never return stale numbers.
+    key = hashlib.sha1(f"{a['_args_key']}|{cif_sha}|{smiles}|{chain}".encode()).hexdigest()
+    result_json = os.path.join(wd, "result.json")
+    if os.path.isfile(result_json) and not a["overwrite"]:
+        try:
+            cached = json.load(open(result_json))
+        except Exception:
+            cached = {}
+        if cached.get("_key") == key:
+            return cached
+    os.makedirs(wd, exist_ok=True)
+
+    # One run per working directory at a time: a second process scoring the same
+    # structure into the same place would overwrite the PDBQT files mid-run and
+    # both would report mixed-up numbers.
+    lock = open(os.path.join(wd, ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        row.update(status="failed",
+                   error=f"another run is scoring this structure into {wd} right now; "
+                         f"wait for it, or use a different --workdir/--output-dir")
+        return row
 
     try:
-        # Removed -xr flag for ligand preparation. 
-        # OpenBabel should correctly identify rotatable bonds and assign atom types for a flexible ligand.
-        cmd = [OBABEL_EXECUTABLE, LIGAND_H_PDB, "-O", ligand_pdbqt_out, "--partialcharge", "gasteiger"]
-        print(f"Running OpenBabel for ligand: {' '.join(cmd)}")
-        process = subprocess.run(
-            cmd,
-            check=False, 
-            capture_output=True, text=True
-        )
-        if process.returncode != 0:
-            print(f"Error running OpenBabel for ligand PDBQT conversion (Exit code: {process.returncode}):")
-            print(f"Command: {' '.join(cmd)}")
-            print(f"Stdout: {process.stdout}")
-            print(f"Stderr: {process.stderr}")
-            sys.exit(1)
-        if not os.path.exists(ligand_pdbqt_out) or os.path.getsize(ligand_pdbqt_out) == 0:
-            print(f"Error: OpenBabel ligand PDBQT conversion failed to produce output file or file is empty: {ligand_pdbqt_out}")
-            print(f"Command: {' '.join(cmd)}")
-            print(f"Stdout: {process.stdout}")
-            print(f"Stderr: {process.stderr}")
-            sys.exit(1)
-        print(f"Ligand PDBQT saved to: {ligand_pdbqt_out}")
+        row.update(af3_metadata(cif, chain))
+        elems, xyz = split_complex(model, chain, os.path.join(wd, "receptor.pdb"))
+        molH, stereo_ok, stereo_note, as_built = build_ligand(elems, xyz, smiles)
+        row.update(n_heavy=molH.GetNumHeavyAtoms(),
+                   formula=Chem.rdMolDescriptors.CalcMolFormula(molH),
+                   formal_charge=Chem.GetFormalCharge(molH),
+                   stereo_ok=stereo_ok, stereo_note=stereo_note,
+                   smiles_as_built=as_built)
+        if molH.GetNumHeavyAtoms() < 2:
+            raise SkipLigand("monatomic ligand (a lone ion) - Vina has no scoring "
+                             "terms for it, and Open Babel cannot build a PDBQT")
+        w = Chem.SDWriter(os.path.join(wd, "ligand_af3.sdf"))
+        w.write(molH)
+        w.close()
+
+        prep_receptor("receptor.pdb", "receptor.pdbqt", a["ph"], wd)
+        prep_ligand("ligand_af3.sdf", "ligand.pdbqt", wd)
+        rmsd = PoseRMSD(molH, os.path.join(wd, "ligand.pdbqt"))
+
+        base = [VINA, "--receptor", "receptor.pdbqt", "--ligand", "ligand.pdbqt",
+                "--cpu", str(a["cpu"]), "--seed", str(a["seed"])]
+
+        row["vina_score_only"] = vina_energy(run(base + ["--score_only", "--autobox"], wd))
+
+        out = run(base + ["--local_only", "--autobox", "--out", "ligand_localmin.pdbqt"], wd)
+        row["vina_local_min"] = vina_energy(out)
+        row["local_min_rmsd"] = round(
+            rmsd(read_pdbqt_models(os.path.join(wd, "ligand_localmin.pdbqt"))[0][1]), 3)
+
+        if a["dock"]:
+            center = xyz.mean(axis=0)
+            size = np.maximum(xyz.max(0) - xyz.min(0) + 2 * a["padding"], 10.0)
+            box = []
+            for k, ax in enumerate("xyz"):
+                box += [f"--center_{ax}", f"{center[k]:.3f}", f"--size_{ax}", f"{size[k]:.3f}"]
+            run(base + box + ["--exhaustiveness", str(a["exhaustiveness"]),
+                              "--num_modes", str(a["num_modes"]), "--energy_range", "4",
+                              "--out", "ligand_docked.pdbqt"], wd)
+            poses = read_pdbqt_models(os.path.join(wd, "ligand_docked.pdbqt"))
+            scored = [(aff, rmsd(atoms)) for aff, atoms in poses]
+            with open(os.path.join(wd, "docked_poses.tsv"), "w") as fh:
+                fh.write("mode\tvina\trmsd_to_predicted\n")
+                for i, (aff, r) in enumerate(scored, 1):
+                    fh.write(f"{i}\t{aff}\t{r:.3f}\n")
+            row["dock_best"], r0 = scored[0]
+            row["dock_best_rmsd"] = round(r0, 3)
+            near = [(aff, r) for aff, r in scored if r <= 2.0]
+            if near:
+                row["dock_best_within_2A"], rn = near[0]
+                row["dock_rmsd_of_best_within_2A"] = round(rn, 3)
+        row["status"] = "ok"
+    except SkipLigand as e:
+        row["status"] = "skipped"
+        row["error"] = str(e)
     except Exception as e:
-        print(f"An unexpected error occurred during OpenBabel ligand PDBQT conversion: {e}")
-        sys.exit(1)
+        row["status"] = "failed"
+        row["error"] = str(e).strip().splitlines()[0][:300] if str(e).strip() else repr(e)
+        with open(os.path.join(wd, "error.log"), "w") as fh:
+            fh.write(traceback.format_exc())
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    if not a["keep_files"]:
+        p = os.path.join(wd, "receptor.pdb")
+        if os.path.exists(p):
+            os.remove(p)
+    if row.get("status") in ("ok", "skipped"):
+        json.dump(dict(row, _key=key), open(result_json, "w"), indent=1, default=str)
+    return row
 
 
-def prepare_protein_pdbqt(protein_pdb_in, protein_pdbqt_out, ph=7.4):
-    """
-    Prepares protein PDBQT:
-    1. Adds hydrogens using OpenBabel at specified pH, saves as protein_h.pdb.
-    2. Converts protein_h.pdb to PDBQT using OpenBabel (as receptor).
-    """
-    print(f"Preparing protein: {protein_pdb_in} -> {protein_pdbqt_out}")
+def process(job):
+    """Score every ligand chain of one CIF. Returns a list of rows."""
+    cif, wd, a = job["cif"], job["workdir"], job["args"]
+    name = job_name(cif)
+    failed = {"name": name, "cif": cif, "workdir": wd, "status": "failed"}
 
     try:
-        cmd_add_h = [OBABEL_EXECUTABLE, protein_pdb_in, "-O", PROTEIN_H_PDB, f"-p{ph}"]
-        print(f"Running OpenBabel to add hydrogens to protein: {' '.join(cmd_add_h)}")
-        process_add_h = subprocess.run(cmd_add_h, check=False, capture_output=True, text=True)
-        if process_add_h.returncode != 0:
-            print(f"Error running OpenBabel for adding hydrogens to protein (Exit code: {process_add_h.returncode}):")
-            print(f"Command: {' '.join(cmd_add_h)}")
-            print(f"Stdout: {process_add_h.stdout}")
-            print(f"Stderr: {process_add_h.stderr}")
-            sys.exit(1)
-        if not os.path.exists(PROTEIN_H_PDB) or os.path.getsize(PROTEIN_H_PDB) == 0:
-            print(f"Error: OpenBabel protein hydrogenation failed to produce output file or file is empty: {PROTEIN_H_PDB}")
-            print(f"Command: {' '.join(cmd_add_h)}")
-            print(f"Stdout: {process_add_h.stdout}")
-            print(f"Stderr: {process_add_h.stderr}")
-            sys.exit(1)
-        print(f"Protein with OpenBabel hydrogens (pH {ph}) saved to: {PROTEIN_H_PDB}")
+        model, cifdict = read_cif(cif)
     except Exception as e:
-        print(f"An unexpected error occurred during OpenBabel protein hydrogenation: {e}")
-        sys.exit(1)
+        failed["error"] = f"cannot read as a structure: {str(e).strip().splitlines()[0][:200]}"
+        return [failed]
 
-    try:
-        # -xr flag is appropriate here for preparing a rigid receptor
-        cmd_to_pdbqt = [OBABEL_EXECUTABLE, PROTEIN_H_PDB, "-O", protein_pdbqt_out, "-xr"]
-        print(f"Running OpenBabel to convert protein to PDBQT: {' '.join(cmd_to_pdbqt)}")
-        process_to_pdbqt = subprocess.run(cmd_to_pdbqt, check=False, capture_output=True, text=True)
-        if process_to_pdbqt.returncode != 0:
-            print(f"Error running OpenBabel for protein PDBQT conversion (Exit code: {process_to_pdbqt.returncode}):")
-            print(f"Command: {' '.join(cmd_to_pdbqt)}")
-            print(f"Stdout: {process_to_pdbqt.stdout}")
-            print(f"Stderr: {process_to_pdbqt.stderr}")
-            sys.exit(1)
-        if not os.path.exists(protein_pdbqt_out) or os.path.getsize(protein_pdbqt_out) == 0:
-            print(f"Error: OpenBabel protein PDBQT conversion failed to produce output file or file is empty: {protein_pdbqt_out}")
-            print(f"Command: {' '.join(cmd_to_pdbqt)}")
-            print(f"Stdout: {process_to_pdbqt.stdout}")
-            print(f"Stderr: {process_to_pdbqt.stderr}")
-            sys.exit(1)
-        print(f"Protein PDBQT saved to: {protein_pdbqt_out}")
-    except Exception as e:
-        print(f"An unexpected error occurred during OpenBabel protein PDBQT conversion: {e}")
-        sys.exit(1)
+    ligs = ligand_from_cif(cifdict)
+    if a["ligand_chain"]:
+        ligs = [l for l in ligs if l[1] == a["ligand_chain"]]
+        if not ligs:
+            model_chains = [c.id for c in model]
+            failed["error"] = (f"chain {a['ligand_chain']} is not a ligand chain in this CIF "
+                               f"(chains present: {model_chains})")
+            return [failed]
+    chains = sorted({ch for _, ch, _ in ligs})
+    if not chains:
+        return [dict(failed, status="skipped",
+                     error="no ligand in this structure (protein-only prediction)")]
+    if a["smiles"] and len(chains) > 1:
+        failed["error"] = (f"--smiles was given but the CIF has several ligand chains "
+                           f"{chains}; say which one with --ligand_chain")
+        return [failed]
 
-
-def get_vina_config_params(ligand_pdb_for_box, padding=10.0):
-    """
-    Calculates Vina box parameters (center, size) based on ligand coordinates.
-    """
-    print(f"Calculating Vina box parameters from: {ligand_pdb_for_box}")
-    try:
-        u = mda.Universe(ligand_pdb_for_box)
-    except (NoDataError, FileNotFoundError, Exception) as e:
-        print(f"Error: MDAnalysis could not load ligand PDB for box calculation: {ligand_pdb_for_box}")
-        print(f"Details: {e}")
-        if os.path.exists(ligand_pdb_for_box) and os.path.getsize(ligand_pdb_for_box) == 0:
-             print("The ligand PDB file for box calculation is empty.")
-        sys.exit(1)
-    
-    if not u.atoms: 
-        print(f"Error: No atoms found in {ligand_pdb_for_box} by MDAnalysis. Cannot define docking box.")
-        sys.exit(1)
-        
-    lig_atoms = u.select_atoms("all") 
-    if not lig_atoms: 
-        print(f"Error: No atoms selected in {ligand_pdb_for_box} by MDAnalysis. Check PDB content.")
-        sys.exit(1)
-
-    center = lig_atoms.center_of_geometry()
-    positions = lig_atoms.positions
-    min_coords = positions.min(axis=0)
-    max_coords = positions.max(axis=0)
-    
-    for i in range(3):
-        if max_coords[i] == min_coords[i]:
-            max_coords[i] += 0.1 
-
-    size = (max_coords - min_coords) + (2 * padding) 
-    size = np.maximum(size, np.array([1.0, 1.0, 1.0])) 
-
-    print(f"  Ligand Center (x,y,z): {center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}")
-    print(f"  Box Size (x,y,z): {size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f} (includes {padding}A padding on each side)")
-    return center, size
+    cif_sha = _file_sha1(cif)
+    rows = []
+    for chain in chains:
+        comp = next(c for c, ch, _ in ligs if ch == chain)
+        smiles = a["smiles"] or next(s for _, ch, s in ligs if ch == chain)
+        source = "--smiles" if a["smiles"] else ("CIF" if smiles else None)
+        if not smiles:
+            smiles, source = smiles_from_input(cif, chain)
+        rname = name if len(chains) == 1 else f"{name}__{chain}"
+        cwd = wd if len(chains) == 1 else os.path.join(wd, f"chain_{chain}")
+        if not smiles:
+            msg = (f"no SMILES for ligand chain {chain} in the CIF or in any input "
+                   f"JSON/YAML beside or above it; pass --smiles")
+            ph = placeholder_ancestors(cif)
+            if len(ph) >= 2:
+                msg += (f". Every directory above the CIF ({len(ph)} levels checked) holds "
+                        f"nothing but the path down to it, which is what Apptainer shows when "
+                        f"that filesystem is not bound: the input file that defines this "
+                        f"ligand is probably there on the host but invisible here. {BIND_HINT}")
+            rows.append(dict(failed, name=rname, workdir=cwd, ligand_chain=chain,
+                             ligand_comp=comp, error=msg))
+            continue
+        rows.append(_score_chain(cif, cwd, a, model, chain, comp, smiles, source,
+                                 cif_sha, rname))
+    return rows
 
 
-def write_vina_config(receptor_pdbqt, ligand_pdbqt, out_pdbqt, 
-                      center_xyz, size_xyz, config_filepath,
-                      num_modes=10, energy_range=3, exhaustiveness=8, seed=None):
-    """Writes the Vina configuration file.
-    Note: 'log' parameter is removed as it's not supported by Vina 1.2.3 config.
-    Log will be handled by capturing stdout from subprocess.
-    """
-    print(f"Writing Vina configuration to: {config_filepath}")
-    config_content = f"""
-receptor = {os.path.abspath(receptor_pdbqt)}
-ligand = {os.path.abspath(ligand_pdbqt)}
-
-out = {os.path.abspath(out_pdbqt)}
-
-center_x = {center_xyz[0]:.4f}
-center_y = {center_xyz[1]:.4f}
-center_z = {center_xyz[2]:.4f}
-
-size_x = {size_xyz[0]:.4f}
-size_y = {size_xyz[1]:.4f}
-size_z = {size_xyz[2]:.4f}
-
-num_modes = {num_modes}
-energy_range = {energy_range}
-exhaustiveness = {exhaustiveness}
-"""
-    if seed is not None:
-        config_content += f"seed = {seed}\n"
-
-    with open(config_filepath, 'w') as f:
-        f.write(config_content)
-    print("Vina configuration file written.")
-
-
-def run_vina(vina_executable, config_filepath, log_filepath):
-    """
-    Runs AutoDock Vina and captures its stdout to a log file.
-    """
-    print(f"Running AutoDock Vina with config: {config_filepath}")
-    print(f"Vina output (log) will be saved to: {log_filepath}")
-    command = [vina_executable, "--config", os.path.abspath(config_filepath)]
-    try:
-        process = subprocess.run(command, check=True, capture_output=True, text=True, cwd=os.getcwd())
-        
-        # Write Vina's stdout to the log file
-        with open(log_filepath, 'w') as log_f:
-            log_f.write("Vina STDOUT:\n")
-            log_f.write(process.stdout)
-            if process.stderr:
-                log_f.write("\nVina STDERR:\n")
-                log_f.write(process.stderr)
-        
-        print("Vina run completed successfully.")
-        print(f"Full Vina output saved to {log_filepath}")
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Error running AutoDock Vina (Exit code: {e.returncode}):")
-        print(f"Command: {' '.join(e.cmd)}")
-        with open(log_filepath, 'w') as log_f:
-            log_f.write(f"Error running Vina. Command: {' '.join(e.cmd)}\n")
-            log_f.write("Vina STDOUT:\n")
-            log_f.write(e.stdout)
-            log_f.write("\nVina STDERR:\n")
-            log_f.write(e.stderr)
-        print(f"Vina output (error) saved to {log_filepath}")
-        sys.exit(1)
-    except FileNotFoundError:
-        print(f"Error: Vina executable '{vina_executable}' not found. Is it in your PATH?")
-        print("In Colab, ensure the setup cells at the top of the script were run correctly.")
-        sys.exit(1)
-
-def extract_binding_affinity(vina_out_pdbqt_filepath, num_modes_to_extract=1):
-    """
-    Extracts binding affinity for the top mode(s) from Vina output PDBQT.
-    """
-    print(f"Extracting binding affinity from: {vina_out_pdbqt_filepath}")
-    affinities = []
-    try:
-        with open(vina_out_pdbqt_filepath, 'r') as f:
-            for line in f:
-                if line.startswith("REMARK VINA RESULT:"):
-                    parts = line.split()
-                    try:
-                        affinity = float(parts[3]) 
-                        affinities.append(affinity)
-                    except (IndexError, ValueError) as e:
-                        print(f"Warning: Could not parse affinity from Vina output line: {line.strip()} - {e}")
-                if len(affinities) >= num_modes_to_extract: 
-                    break 
-        
-        if affinities:
-            print(f"Top binding affinity (kcal/mol): {affinities[0]}")
-            if len(affinities) > 1:
-                print(f"Affinities for top {len(affinities)} modes: {affinities}")
-            return affinities[0] 
-        else:
-            print(f"Warning: No binding affinity lines (REMARK VINA RESULT) found in Vina output file: {vina_out_pdbqt_filepath}")
-            print("Check the Vina log file for errors or details. The docking might have failed or produced no valid poses.")
-            return None
-
-    except FileNotFoundError:
-        print(f"Error: Vina output PDBQT file not found: {vina_out_pdbqt_filepath}")
-        return None
-
-def cleanup_files(files_to_delete):
-    """Deletes specified intermediate files."""
-    print("\nCleaning up intermediate files...")
-    for f_path in files_to_delete:
-        if os.path.exists(f_path):
-            try:
-                os.remove(f_path)
-                print(f"  Removed: {f_path}")
-            except OSError as e:
-                print(f"  Warning: Could not remove {f_path} - {e}")
-        else:
-            print(f"  Skipped (not found): {f_path}")
+def report(row):
+    """Human-readable summary for a single structure."""
+    n = row["name"]
+    if row.get("status") == "skipped":
+        print(f"\n--- {n}: skipped ---\n  {row.get('error')}")
+        return
+    if row.get("status") != "ok":
+        warn(f"\n--- {n}: FAILED ---\n  {row.get('error')}")
+        if os.path.isfile(os.path.join(row.get("workdir", ""), "error.log")):
+            warn(f"  see {row['workdir']}/error.log")
+        return
+    print(f"\n--- {n} ---")
+    print(f"  ligand          : {row['ligand_comp']} (chain {row['ligand_chain']})  "
+          f"{row['formula']}  charge {row['formal_charge']}  {row['n_heavy']} heavy atoms")
+    print(f"  SMILES          : {row['smiles']}   (from {row.get('smiles_source')})")
+    if row.get("stereo_note"):
+        print(f"  ! stereochemistry: {row['stereo_note']}")
+        if not row.get("stereo_ok", True):
+            print(f"    scored as    : {row.get('smiles_as_built')}")
+    print(f"  Vina score_only : {row['vina_score_only']:+.3f} kcal/mol   (pose as predicted)")
+    print(f"  Vina local_min  : {row['vina_local_min']:+.3f} kcal/mol   "
+          f"(relaxed in place, moved {row['local_min_rmsd']:.2f} A)")
+    if row.get("dock_best") is not None:
+        print(f"  Vina redock     : {row['dock_best']:+.3f} kcal/mol   "
+              f"(best pose, {row['dock_best_rmsd']:.2f} A from the predicted pose)")
+        if row.get("dock_best_within_2A") is not None:
+            print(f"    best pose within 2 A of prediction: {row['dock_best_within_2A']:+.3f} kcal/mol")
+    if row.get("af3_ranking_score") is not None:
+        print(f"  AlphaFold3      : ranking_score {row['af3_ranking_score']}  "
+              f"ptm {row.get('af3_ptm')}  iptm {row.get('af3_iptm')}")
+    if row.get("vina_score_only", 0) > 0:
+        print("  ! positive score_only: the predicted pose clashes; trust local_min instead")
+    print(f"  files           : {row['workdir']}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Automated docking pipeline using Biopython, RDKit, MDAnalysis, and AutoDock Vina. Designed for Colab compatibility.",
-        formatter_class=argparse.RawTextHelpFormatter, 
-        epilog="""
-Example usage:
-  python script_name.py input.cif --ligand_resname LIG --padding 10.0
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="+",
+                    help="CIF file(s) and/or directories to search for *.cif")
+    ap.add_argument("-o", "--out", help="write a CSV here (default: only for >1 structure)")
+    ap.add_argument("-w", "--workdir", default="vina_work",
+                    help="per-structure working dirs (default vina_work/)")
+    ap.add_argument("--smiles", help="ligand SMILES (overrides the one in the CIF / input file)")
+    ap.add_argument("--ligand_chain", help="ligand chain ID (default: every non-polymer chain)")
+    ap.add_argument("--ph", type=float, default=7.4,
+                    help="receptor protonation pH for Open Babel (default 7.4)")
+    ap.add_argument("--dock", action="store_true",
+                    help="also redock in a box around the predicted pose")
+    ap.add_argument("--padding", type=float, default=6.0,
+                    help="dock box padding around ligand per side, A (default 6)")
+    ap.add_argument("--exhaustiveness", type=int, default=16)
+    ap.add_argument("--num_modes", type=int, default=9)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("-j", "--jobs", type=int, default=1, help="structures processed in parallel")
+    ap.add_argument("--cpu", type=int, default=0,
+                    help="CPUs per Vina run (default: all if -j 1, else 1)")
+    ap.add_argument("--overwrite", action="store_true", help="recompute even if cached")
+    ap.add_argument("--keep_files", action="store_true", help="also keep receptor.pdb")
+    args = ap.parse_args()
 
-In Google Colab:
-1. Upload this script and your CIF file.
-2. Run the setup commands in a Colab cell (see top of script).
-3. Run the script from a Colab cell:
-   !python script_name.py your_complex.cif --ligand_resname XYZ
-"""
-    )
-    parser.add_argument("cif_file", help="Input CIF file containing protein-ligand complex.")
-    parser.add_argument("--ligand_resname", help="Residue name of the ligand in the CIF file (e.g., 'LIG', 'STI'). If not provided, the script will try to identify the first non-water HETATM.", default=None)
-    parser.add_argument("--padding", type=float, default=10.0, help="Padding around ligand for Vina box size (Angstroms). Default: 10.0 A on each side.")
-    parser.add_argument("--num_modes", type=int, default=10, help="Number of binding modes for Vina. Default: 10.")
-    parser.add_argument("--exhaustiveness", type=int, default=8, help="Exhaustiveness of Vina search. Default: 8.")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for Vina. Default: None (Vina uses time-based seed).")
-    parser.add_argument("--protein_ph", type=float, default=7.4, help="pH for protonating the protein using OpenBabel. Default: 7.4.")
-    parser.add_argument("--keep_files", action="store_true", help="Keep intermediate files instead of deleting them.")
-    
-    args = parser.parse_args()
+    for exe in (VINA, OBABEL):
+        if not shutil.which(exe):
+            sys.exit(f"'{exe}' not found on PATH")
 
-    print("--- Starting Docking Pipeline ---")
-    print(f"Input CIF: {args.cif_file}")
-    if args.ligand_resname:
-        print(f"Target Ligand Residue Name: {args.ligand_resname}")
-    print(f"Vina Box Padding: {args.padding} A")
+    cifs = find_cifs(args.inputs)
+    if not cifs:
+        sys.exit(f"no .cif files found under {args.inputs}")
+    if args.cpu == 0:
+        args.cpu = os.cpu_count() if args.jobs == 1 else 1
 
+    a = vars(args).copy()
+    a["_args_key"] = json.dumps({k: a[k] for k in
+                                 ("smiles", "ligand_chain", "ph", "dock", "padding",
+                                  "exhaustiveness", "num_modes", "seed")}, sort_keys=True)
 
-    if not os.path.exists(args.cif_file):
-        print(f"Error: Input CIF file not found: {args.cif_file}")
-        sys.exit(1)
+    jobs = [{"cif": c, "workdir": os.path.abspath(os.path.join(args.workdir, workdir_tag(c))),
+             "args": a} for c in cifs]
 
-    check_executables() 
+    if len(jobs) > 1:
+        print(f"{len(jobs)} structure(s); dock={'yes' if args.dock else 'no'}; "
+              f"jobs={args.jobs}; cpu/vina={args.cpu}", flush=True)
 
-    ligand_pdb_for_box, actual_ligand_name = parse_cif_to_pdb(args.cif_file, PROTEIN_PDB, LIGAND_PDB, args.ligand_resname)
-    if not ligand_pdb_for_box or not actual_ligand_name :
-        print("Exiting due to error in CIF parsing or ligand identification.")
-        sys.exit(1)
-    print(f"Successfully parsed CIF. Identified ligand: {actual_ligand_name}")
-
-    prepare_ligand_pdbqt(LIGAND_PDB, LIGAND_PDBQT)
-    prepare_protein_pdbqt(PROTEIN_PDB, PROTEIN_PDBQT, ph=args.protein_ph)
-
-    center_xyz, size_xyz = get_vina_config_params(LIGAND_PDB, padding=args.padding) 
-
-    write_vina_config(PROTEIN_PDBQT, LIGAND_PDBQT, VINA_OUT_PDBQT,
-                      center_xyz, size_xyz, VINA_CONFIG_FILE,
-                      num_modes=args.num_modes, exhaustiveness=args.exhaustiveness, seed=args.seed)
-
-    run_vina(VINA_EXECUTABLE, VINA_CONFIG_FILE, VINA_LOG_FILE) 
-
-    best_affinity = extract_binding_affinity(VINA_OUT_PDBQT, num_modes_to_extract=args.num_modes)
-
-    if best_affinity is not None:
-        print(f"\n--- Docking Workflow Completed ---")
-        print(f"Best Binding Affinity for {actual_ligand_name} with {os.path.basename(args.cif_file)}: {best_affinity:.3f} kcal/mol")
-        print(f"Output PDBQT with docked poses: {os.path.abspath(VINA_OUT_PDBQT)}")
-        print(f"Vina log file: {os.path.abspath(VINA_LOG_FILE)}")
+    if args.jobs > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            rows = [r for rs in ex.map(process, jobs) for r in rs]
     else:
-        print(f"\n--- Docking Workflow Completed with Issues ---")
-        print("Could not determine binding affinity. Please check log files and Vina output PDBQT.")
-        print(f"Attempted Vina output PDBQT: {os.path.abspath(VINA_OUT_PDBQT)}")
-        print(f"Vina log file: {os.path.abspath(VINA_LOG_FILE)}")
+        rows = [r for j in jobs for r in process(j)]
 
+    for r in rows:
+        report(r)
 
-    if not args.keep_files:
-        files_to_remove = [
-            PROTEIN_PDB, LIGAND_PDB, LIGAND_H_PDB, 
-            PROTEIN_H_PDB, 
-            VINA_CONFIG_FILE, 
-        ]
-        cleanup_files(files_to_remove)
-    else:
-        print("\nIntermediate files have been kept as requested.")
-        print(f"  Protein PDB: {os.path.abspath(PROTEIN_PDB)}")
-        print(f"  Ligand PDB: {os.path.abspath(LIGAND_PDB)}")
-        print(f"  Ligand PDBQT: {os.path.abspath(LIGAND_PDBQT)}")
-        print(f"  Protein PDBQT: {os.path.abspath(PROTEIN_PDBQT)}")
-        print(f"  Vina Config: {os.path.abspath(VINA_CONFIG_FILE)}")
+    out = args.out or (os.path.join(args.workdir, "vina_scores.csv") if len(rows) > 1 else None)
+    if out:
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+        with open(out, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(sorted(rows, key=lambda r: r["name"]))
+        print(f"\nwrote {out}")
+
+    nok = sum(r.get("status") == "ok" for r in rows)
+    nskip = sum(r.get("status") == "skipped" for r in rows)
+    nfail = len(rows) - nok - nskip
+    if len(rows) > 1:
+        print(f"{nok} ok, {nskip} skipped, {nfail} failed"
+              + (f"; details in {args.workdir}/*/error.log" if nfail else ""))
+    # A job script must be able to tell: any failure is a non-zero exit, skips are not.
+    sys.exit(1 if nfail else 0)
+
 
 if __name__ == "__main__":
     main()
-
-#!python docking.py 5op_model.cif --ligand_resname LIG --num_modes 5

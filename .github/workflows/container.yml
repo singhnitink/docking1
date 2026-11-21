@@ -1,0 +1,219 @@
+name: build and publish container
+
+# Builds the Apptainer image on a GitHub-hosted runner and publishes it to the
+# GitHub Container Registry (GHCR) as an ORAS artifact.
+#
+# Pull the published image with:
+#   apptainer pull oras://ghcr.io/<owner>/<repo>/docking-of3:latest
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'docking_of3.def'
+      - 'docking.py'
+      - 'make_query.py'
+      - 'run_pipeline.sh'
+      - '.github/workflows/container.yml'
+  pull_request:
+    paths:
+      - 'docking_of3.def'
+      - 'docking.py'
+      - 'make_query.py'
+      - 'run_pipeline.sh'
+      - '.github/workflows/container.yml'
+  workflow_dispatch:
+    inputs:
+      bake_weights:
+        description: 'Download the 2.3 GB OpenFold3 checkpoint into the image'
+        type: boolean
+        default: false
+      push_image:
+        description: 'Publish to GHCR even from a manual run'
+        type: boolean
+        default: true
+
+env:
+  IMAGE_NAME: docking-of3
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Fast feedback: never spend 40 minutes building a container whose
+  # scripts do not even parse.
+  # ---------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n run_pipeline.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          # SC1091: we do not follow sourced files; SC2086: intentional in places
+          shellcheck -S warning -e SC1091 run_pipeline.sh || true
+          shellcheck -S error -e SC1091 run_pipeline.sh
+
+      - name: Python syntax
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m py_compile docking.py make_query.py
+
+      - name: Definition file sanity
+        run: |
+          grep -q '^Bootstrap:' docking_of3.def
+          grep -q '^%post' docking_of3.def
+          grep -q '^%runscript' docking_of3.def
+          # every %files source must exist in the repo
+          awk '/^%files/{f=1;next} /^%[a-z]/{f=0} f && NF && $1 !~ /^#/ {print $1}' \
+              docking_of3.def | while read -r src; do
+            test -e "$src" || { echo "::error::%files source missing: $src"; exit 1; }
+          done
+          echo "definition file OK"
+
+  # ---------------------------------------------------------------------
+  # Build, smoke-test, publish
+  # ---------------------------------------------------------------------
+  build:
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A GitHub-hosted runner has far too little free space on / for a CUDA
+      # + PyTorch image. Reclaim the preinstalled toolchains we do not use.
+      - name: Free disk space
+        run: |
+          echo "before:"; df -h / /mnt | sed 's/^/  /'
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / /mnt | sed 's/^/  /'
+
+      - name: Install Apptainer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:apptainer/ppa
+          sudo apt-get update
+          sudo apt-get install -y apptainer
+          apptainer --version
+
+      # /mnt is the big ephemeral disk on an Azure runner; / is not big enough
+      # to hold the build sandbox plus the finished image.
+      - name: Prepare build scratch
+        run: |
+          sudo mkdir -p /mnt/apptainer/tmp /mnt/apptainer/cache /mnt/apptainer/out
+          sudo chown -R "$USER" /mnt/apptainer
+          echo "APPTAINER_TMPDIR=/mnt/apptainer/tmp" >> "$GITHUB_ENV"
+          echo "APPTAINER_CACHEDIR=/mnt/apptainer/cache" >> "$GITHUB_ENV"
+          echo "SIF=/mnt/apptainer/out/${IMAGE_NAME}.sif"  >> "$GITHUB_ENV"
+
+      - name: Decide build flavour
+        id: flavour
+        run: |
+          bake="no"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.bake_weights }}" = "true" ]; then
+            bake="yes"
+          fi
+          echo "bake=$bake" >> "$GITHUB_OUTPUT"
+          echo "Building with BAKE_WEIGHTS=$bake"
+
+      # sudo, not --fakeroot: the runner gives us real root, which avoids the
+      # /etc/subuid setup that unprivileged fakeroot builds need.
+      - name: Build image
+        run: |
+          sudo -E apptainer build \
+            --build-arg BAKE_WEIGHTS=${{ steps.flavour.outputs.bake }} \
+            "$SIF" docking_of3.def
+          sudo chown "$USER" "$SIF"
+          ls -lh "$SIF"
+          df -h / /mnt | sed 's/^/  /'
+
+      # Prove the image actually works before publishing it. gsh_model.cif is
+      # committed to the repo, so this is a real end-to-end check of the
+      # scoring path: CIF in, binding score out. No GPU or network needed.
+      - name: Smoke test - score a known structure
+        run: |
+          set -o pipefail
+          apptainer run "$SIF" --cif gsh_model.cif --output-dir smoke/ 2>&1 | tee smoke.log
+
+          echo "--- checking results ---"
+          # the ligand must be rebuilt as real glutathione, not the all-single-bond
+          # version a naive CIF read produces (C10H25N3O6S)
+          grep -q 'C10H17N3O6S' smoke.log \
+            || { echo "::error::wrong ligand formula - bond orders not restored"; exit 1; }
+          test -f smoke/vina_scores.csv \
+            || { echo "::error::no vina_scores.csv produced"; exit 1; }
+          python3 - <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open("smoke/vina_scores.csv")))
+          assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
+          r = rows[0]
+          assert r["status"] == "ok", r
+          assert r["formula"] == "C10H17N3O6S", r["formula"]
+          lm = float(r["vina_local_min"])
+          assert -20 < lm < 5, f"implausible local_min {lm}"
+          print("smoke test OK:", r["name"], r["formula"], lm)
+          PY
+
+      - name: Check OpenFold3 environment inside the image
+        run: |
+          apptainer exec "$SIF" /opt/conda/envs/of3/bin/python -c \
+            'import torch, openfold3, importlib.metadata as md; print("of3", md.version("openfold3"), "torch", torch.__version__)'
+          apptainer exec "$SIF" /opt/conda/envs/of3/bin/run_openfold --help > /dev/null
+          apptainer exec "$SIF" vina --version
+          echo "image internals OK"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            apptainer registry login -u "${{ github.actor }}" --password-stdin oras://ghcr.io
+
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          # GHCR paths must be lowercase
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          base="oras://ghcr.io/${repo}/${IMAGE_NAME}"
+
+          suffix=""
+          [ "${{ steps.flavour.outputs.bake }}" = "yes" ] && suffix="-withweights"
+
+          tags="latest${suffix}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tags="$tags ${{ github.ref_name }}${suffix}"
+          fi
+          tags="$tags $(echo ${{ github.sha }} | cut -c1-7)${suffix}"
+
+          for t in $tags; do
+            echo "pushing ${base}:${t}"
+            apptainer push "$SIF" "${base}:${t}"
+          done
+
+          {
+            echo "### Published"
+            echo '```'
+            for t in $tags; do echo "apptainer pull ${base}:${t}"; done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image as a build artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IMAGE_NAME }}-sif
+          path: /mnt/apptainer/out/*.sif
+          retention-days: 5
+          compression-level: 0
