@@ -45,6 +45,9 @@ molecule was scored.
 apptainer pull oras://ghcr.io/<owner>/docking1/docking-of3:latest
 ```
 
+Singularity-CE 4.x works the same way — replace `apptainer` with `singularity` in
+every command here (tested with singularity-ce 4.1.1).
+
 or build it yourself (needs root/`--fakeroot`, ~40 GB scratch, about an hour):
 
 ```bash

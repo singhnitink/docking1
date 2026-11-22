@@ -45,7 +45,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Shell syntax
         run: bash -n run_pipeline.sh
@@ -86,7 +86,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # A GitHub-hosted runner has far too little free space on / for a CUDA
       # + PyTorch image. Reclaim the preinstalled toolchains we do not use.
@@ -99,14 +99,61 @@ jobs:
           sudo docker image prune -af || true
           echo "after:"; df -h / /mnt | sed 's/^/  /'
 
-      - name: Install Apptainer
+      # GitHub-hosted runners ship neither Apptainer nor Singularity, so install
+      # Apptainer. A self-hosted runner that already has either is used as is:
+      # the def, the registry login and the ORAS push work with both (verified
+      # with singularity-ce 4.1.1), and $CT names whichever one is present.
+      - name: Install Apptainer (unless a runtime is already present)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:apptainer/ppa
-          sudo apt-get update
-          sudo apt-get install -y apptainer
-          apptainer --version
+          if command -v apptainer > /dev/null; then
+            CT=apptainer
+          elif command -v singularity > /dev/null; then
+            CT=singularity
+          else
+            sudo apt-get update
+            sudo apt-get install -y software-properties-common
+            sudo add-apt-repository -y ppa:apptainer/ppa
+            sudo apt-get update
+            sudo apt-get install -y apptainer
+            CT=apptainer
+          fi
+          echo "CT=$CT" >> "$GITHUB_ENV"
+          "$CT" --version
+
+      # Credentials are verified and the registry login done BEFORE the hour-long
+      # build, so a permissions problem fails in a minute instead of sixty.
+      - name: Check registry credentials
+        if: github.event_name != 'pull_request'
+        env:
+          # GHCR_PAT (a classic PAT with write:packages, added under
+          # Settings -> Secrets -> Actions) overrides the workflow token if set.
+          TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          code=$(curl -s -o /tmp/ghcr-token.json -w '%{http_code}' \
+            -u "${{ github.actor }}:${TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}/${IMAGE_NAME}:pull,push")
+          if [ "$code" != "200" ] || ! grep -q '"token"' /tmp/ghcr-token.json; then
+            echo "::error::GHCR refused the workflow token (HTTP $code): $(head -c 300 /tmp/ghcr-token.json)"
+            echo "Check Settings -> Actions -> General -> Workflow permissions: the token needs packages: write."
+            exit 1
+          fi
+          echo "GHCR accepts the token for ${repo}/${IMAGE_NAME}"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          # GHCR_PAT (a classic PAT with write:packages, added under
+          # Settings -> Secrets -> Actions) overrides the workflow token if set.
+          TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          "$CT" --version
+          if ! echo "$TOKEN" | "$CT" registry login --username "${{ github.actor }}" --password-stdin oras://ghcr.io; then
+            echo "::warning::login with oras://ghcr.io failed, retrying with docker://ghcr.io (debug output on)"
+            ls -la "$HOME/.apptainer" "$HOME/.singularity" 2>&1 || true
+            echo "$TOKEN" | "$CT" -d registry login --username "${{ github.actor }}" --password-stdin docker://ghcr.io
+          fi
+          "$CT" registry list
 
       # /mnt is the big ephemeral disk on an Azure runner; / is not big enough
       # to hold the build sandbox plus the finished image.
@@ -114,8 +161,11 @@ jobs:
         run: |
           sudo mkdir -p /mnt/apptainer/tmp /mnt/apptainer/cache /mnt/apptainer/out
           sudo chown -R "$USER" /mnt/apptainer
+          # both spellings: Apptainer reads APPTAINER_*, singularity-ce SINGULARITY_*
           echo "APPTAINER_TMPDIR=/mnt/apptainer/tmp" >> "$GITHUB_ENV"
           echo "APPTAINER_CACHEDIR=/mnt/apptainer/cache" >> "$GITHUB_ENV"
+          echo "SINGULARITY_TMPDIR=/mnt/apptainer/tmp" >> "$GITHUB_ENV"
+          echo "SINGULARITY_CACHEDIR=/mnt/apptainer/cache" >> "$GITHUB_ENV"
           echo "SIF=/mnt/apptainer/out/${IMAGE_NAME}.sif"  >> "$GITHUB_ENV"
 
       - name: Decide build flavour
@@ -133,10 +183,13 @@ jobs:
       # /etc/subuid setup that unprivileged fakeroot builds need.
       - name: Build image
         run: |
-          sudo -E apptainer build \
+          sudo -E "$CT" build \
             --build-arg BAKE_WEIGHTS=${{ steps.flavour.outputs.bake }} \
             "$SIF" docking_of3.def
           sudo chown "$USER" "$SIF"
+          # the sudo build inherits $HOME and can leave root-owned files under
+          # the runtime's config dir, which breaks the later (unprivileged) push
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.apptainer" "$HOME/.singularity" 2>/dev/null || true
           ls -lh "$SIF"
           df -h / /mnt | sed 's/^/  /'
 
@@ -146,7 +199,7 @@ jobs:
       - name: Smoke test - score a known structure
         run: |
           set -o pipefail
-          apptainer run "$SIF" --cif gsh_model.cif --output-dir smoke/ 2>&1 | tee smoke.log
+          "$CT" run "$SIF" --cif gsh_model.cif --output-dir smoke/ 2>&1 | tee smoke.log
 
           echo "--- checking results ---"
           # the ligand must be rebuilt as real glutathione, not the all-single-bond
@@ -169,17 +222,11 @@ jobs:
 
       - name: Check OpenFold3 environment inside the image
         run: |
-          apptainer exec "$SIF" /opt/conda/envs/of3/bin/python -c \
+          "$CT" exec "$SIF" /opt/conda/envs/of3/bin/python -c \
             'import torch, openfold3, importlib.metadata as md; print("of3", md.version("openfold3"), "torch", torch.__version__)'
-          apptainer exec "$SIF" /opt/conda/envs/of3/bin/run_openfold --help > /dev/null
-          apptainer exec "$SIF" vina --version
+          "$CT" exec "$SIF" /opt/conda/envs/of3/bin/run_openfold --help > /dev/null
+          "$CT" exec "$SIF" vina --version
           echo "image internals OK"
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            apptainer registry login -u "${{ github.actor }}" --password-stdin oras://ghcr.io
 
       - name: Publish to GHCR
         if: github.event_name != 'pull_request'
@@ -199,7 +246,7 @@ jobs:
 
           for t in $tags; do
             echo "pushing ${base}:${t}"
-            apptainer push "$SIF" "${base}:${t}"
+            "$CT" push "$SIF" "${base}:${t}"
           done
 
           {
@@ -211,7 +258,7 @@ jobs:
 
       - name: Upload image as a build artifact
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ env.IMAGE_NAME }}-sif
           path: /mnt/apptainer/out/*.sif
