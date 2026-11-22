@@ -42,17 +42,13 @@ molecule was scored.
 ## The container
 
 ```bash
-apptainer pull oras://ghcr.io/<owner>/docking1/docking-of3:latest
+apptainer pull oras://ghcr.io/singhnitink/docking1/docking-of3:latest
 ```
 
-Singularity-CE 4.x works the same way — replace `apptainer` with `singularity` in
-every command here (tested with singularity-ce 4.1.1).
-
-or build it yourself (needs root/`--fakeroot`, ~40 GB scratch, about an hour):
+or build it yourself:
 
 ```bash
-APPTAINER_TMPDIR=/var/tmp apptainer build docking_of3.sif docking_of3.def
-# with the 2.3 GB OpenFold3 checkpoint baked in (--build-arg goes BEFORE the paths):
+# with the 2.3 GB OpenFold3 checkpoint baked in:
 apptainer build --build-arg BAKE_WEIGHTS=yes docking_of3.sif docking_of3.def
 ```
 
@@ -201,13 +197,12 @@ cannot use one working directory at the same time; the second one says so and ex
 
 ---
 
-## Continuous integration
+## How the image is published
 
-[`.github/workflows/container.yml`](.github/workflows/container.yml) lints the
-scripts, builds the image on a GitHub-hosted runner, scores `gsh_model.cif` inside
-the freshly built image and asserts the formula is `C10H17N3O6S` (so a regression in
-bond-order restoration fails the build), then publishes to GHCR. Pull requests build
-without publishing. A manual run can bake the weights in (`-withweights` tag).
+Every push to `main` rebuilds the image on GitHub Actions, scores `gsh_model.cif`
+inside it to check the ligand still comes out as `C10H17N3O6S`, and publishes it to
+GHCR ([workflow](.github/workflows/container.yml)). A manual run can bake the
+OpenFold3 weights in (`-withweights` tag).
 
 ---
 
